@@ -54,10 +54,27 @@ func executablePath(of pid: Int32) -> String? {
 /// with the Mac (power loss, SIGKILL at logout) can name a reused pid; such
 /// a process must neither block a start nor receive our signals.
 func isAnvilProcess(_ pid: Int32) -> Bool {
-    // Not inspectable (another user's process): not anvil.
-    guard let path = executablePath(of: pid) else { return false }
-    let name = (path as NSString).lastPathComponent
+    // `brew upgrade` deletes the running daemon's keg, and its path no
+    // longer resolves: fall back to the process name, or `anvil restart`
+    // after an upgrade took the running daemon for a stale pid file,
+    // deleted the file and left the old VM running.
+    let name: String
+    if let path = executablePath(of: pid) {
+        name = (path as NSString).lastPathComponent
+    } else if let comm = processName(of: pid) {
+        name = comm
+    } else {
+        return false // not inspectable (another user's process): not anvil
+    }
     return name == "vz-runner" || name == "anvil"
+}
+
+/// The process name (p_comm) of pid, which survives its executable's
+/// deletion.
+func processName(of pid: Int32) -> String? {
+    var buf = [CChar](repeating: 0, count: 256)
+    guard proc_name(pid, &buf, UInt32(buf.count)) > 0 else { return nil }
+    return String(cString: buf)
 }
 
 func saveDockerContext() {
@@ -193,7 +210,12 @@ func waitForControlSocket(timeout: TimeInterval = 60, process: Process? = nil) -
     let deadline = Date().addingTimeInterval(timeout)
     while Date() < deadline {
         var isDir: ObjCBool = false
-        if FileManager.default.fileExists(atPath: sockPath, isDirectory: &isDir), !isDir.boolValue {
+        // With a process to wait for, the socket must be its own: the daemon
+        // writes its pid once it holds the lock. A socket left by another
+        // daemon made `anvil start` print "ready" for a process that had
+        // already exited with "daemon already running".
+        if FileManager.default.fileExists(atPath: sockPath, isDirectory: &isDir), !isDir.boolValue,
+           process.map({ daemonPID() == $0.processIdentifier }) ?? true {
             return true
         }
         // The daemon dying before becoming ready (e.g. invalid kernel) would
@@ -212,11 +234,14 @@ func cmdStart(args: [String]) {
     // After an upgrade the old daemon keeps running the old binary (and, for
     // Homebrew, assets of a keg the upgrade deletes): restart it, as the
     // service wrapper does.
-    if isDaemonRunning(), let pid = daemonPID(), let running = executablePath(of: pid),
-       URL(fileURLWithPath: running).resolvingSymlinksInPath().path
-        != URL(fileURLWithPath: currentExecutablePath()).resolvingSymlinksInPath().path {
-        print("[anvil] daemon runs another binary (\(running)); restarting it")
-        cmdStop(args: [])
+    if isDaemonRunning(), let pid = daemonPID() {
+        // An executable that no longer resolves was deleted by an upgrade.
+        let running = executablePath(of: pid)
+        if running.map({ URL(fileURLWithPath: $0).resolvingSymlinksInPath().path })
+            != URL(fileURLWithPath: currentExecutablePath()).resolvingSymlinksInPath().path {
+            print("[anvil] daemon runs another binary (\(running ?? "deleted by an upgrade")); restarting it")
+            cmdStop(args: [])
+        }
     }
     if isDaemonRunning() {
         let pid = (try? String(contentsOf: daemonPIDFile, encoding: .utf8))?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "?"
@@ -572,9 +597,12 @@ func isAnvilSourceTree(_ dir: URL) -> Bool {
 }
 
 func findProjectRoot() -> String? {
-    // Check current working directory first (user is in the project tree).
+    // Check current working directory first (user is in the project tree)
+    // — not for a Homebrew install: `anvil start` run in a checkout booted
+    // the release with that checkout's old local kernel and initramfs and
+    // shared the checkout instead of ~/.anvil-vz.
     let cwd = FileManager.default.currentDirectoryPath
-    if isAnvilSourceTree(URL(fileURLWithPath: cwd)) {
+    if !currentExecutablePath().contains("/Cellar/"), isAnvilSourceTree(URL(fileURLWithPath: cwd)) {
         return cwd
     }
     // Walk up from the executable looking for the source tree.
