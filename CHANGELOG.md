@@ -1,3 +1,7 @@
+## v1.9.8 (2026-10-11)
+
+### Fixed
+- a57cc9a fix(cli): anvil restart after brew upgrade stops the running daemon
 ## v1.9.7 (2026-10-11)
 
 ### Fixed
