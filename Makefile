@@ -531,14 +531,23 @@ replace-release: sign
 	$(wait_for_release)
 	$(MAKE) update-brew VERSION=$(VERSION)
 
+UPDATE_BREW_WAIT ?= 600
+
 update-brew:
 	$(require_version)
 	@echo "[update-brew] using tap dir: $(HOMEBREW_TAP_DIR)"
 	@test -f "$(HOMEBREW_TAP_DIR)/anvil.rb" || { echo "[update-brew] error: $(HOMEBREW_TAP_DIR)/anvil.rb not found"; exit 1; }
 	@echo "[update-brew] downloading tar.gz and computing sha256..."
-	@tmp=$$(mktemp); \
-		curl -fsSL -o "$$tmp" "https://github.com/olegshirko/anvil/releases/download/v$(VERSION)/anvil-darwin-arm64.tar.gz" || \
-			{ rm -f "$$tmp"; echo "[update-brew] error: release asset v$(VERSION) not downloadable"; exit 1; }; \
+	@# A just-published release asset answers 404 for a few minutes until
+	@# GitHub's CDN has it: retry for up to UPDATE_BREW_WAIT seconds.
+	@tmp=$$(mktemp); url="https://github.com/olegshirko/anvil/releases/download/v$(VERSION)/anvil-darwin-arm64.tar.gz"; \
+		deadline=$$(( $$(date +%s) + $(UPDATE_BREW_WAIT) )); \
+		until curl -fsSL -o "$$tmp" "$$url"; do \
+			if [ $$(date +%s) -ge $$deadline ]; then \
+				rm -f "$$tmp"; echo "[update-brew] error: release asset v$(VERSION) not downloadable after $(UPDATE_BREW_WAIT)s"; exit 1; \
+			fi; \
+			echo "[update-brew] asset not available yet; retrying in 15s..."; sleep 15; \
+		done; \
 		SHA_TAR=$$(shasum -a 256 "$$tmp" | cut -d' ' -f1); rm -f "$$tmp"; \
 		echo "$$SHA_TAR" | grep -Eq '^[0-9a-f]{64}$$' || { echo "[update-brew] error: bad sha256 '$$SHA_TAR'"; exit 1; }; \
 		echo "[update-brew] sha256=$$SHA_TAR"; \
